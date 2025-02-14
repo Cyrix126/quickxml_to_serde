@@ -6,12 +6,15 @@ description = "Convert between XML JSON using quickxml and serde"
 repository = "https://github.com/AlecTroemel/quickxml_to_serde"
 keywords = ["json", "xml", "xml2json", "xml_to_json"]
 license = "MIT"
+edition="2021"
 
 [dependencies]
 serde = "1.0"
 serde_json = "1.0"
 serde_derive = "1.0"
-roxmltree = "0.18.0"
+roxmltree = "0.20.0"
+regex = "1.11.1"
 
 [features]
 json_types = [] # Enable to enforce fixed JSON data types for certain XML nodes
+regex_path = ["json_types"] # Enable Regex matching for JSON types

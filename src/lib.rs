@@ -1,3 +1,8 @@
+#![allow(clippy::items_after_test_module)]
+#![allow(clippy::single_match)]
+#![allow(clippy::single_char_pattern)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::ptr_arg)]
 //! # quickxml_to_serde
 //! Fast and flexible conversion from XML to JSON using [quick-xml](https://github.com/tafia/quick-xml)
 //! and [serde](https://github.com/serde-rs/json). Inspired by [node2object](https://github.com/vorot93/node2object).
@@ -53,9 +58,15 @@
 extern crate roxmltree;
 extern crate serde_json;
 
+#[cfg(feature = "regex_path")]
+extern crate regex;
+
 use serde_json::{Map, Number, Value};
 #[cfg(feature = "json_types")]
 use std::collections::HashMap;
+
+#[cfg(feature = "regex_path")]
+use regex::Regex;
 
 #[cfg(test)]
 mod tests;
@@ -71,20 +82,54 @@ pub enum NullValue {
     Null,
     EmptyObject,
 }
-
 /// Defines how the values of this Node should be converted into a JSON array with the underlying types.
 /// * `Infer` - the nodes are converted into a JSON array only if there are multiple identical elements.
-/// E.g. `<a><b>1</b></a>` becomes a map `{"a": {"b": 1 }}` and `<a><b>1</b><b>2</b><b>3</b></a>` becomes
-/// an array `{"a": {"b": [1, 2, 3] }}`
+///   E.g. `<a><b>1</b></a>` becomes a map `{"a": {"b": 1 }}` and `<a><b>1</b><b>2</b><b>3</b></a>` becomes
+///   an array `{"a": {"b": [1, 2, 3] }}`
 /// * `Always` - the nodes are converted into a JSON array regardless of how many there are.
-/// E.g. `<a><b>1</b></a>` becomes an array with a single value `{"a": {"b": [1] }}` and
-/// `<a><b>1</b><b>2</b><b>3</b></a>` also becomes an array `{"a": {"b": [1, 2, 3] }}`
+///   E.g. `<a><b>1</b></a>` becomes an array with a single value `{"a": {"b": [1] }}` and
+///   `<a><b>1</b><b>2</b><b>3</b></a>` also becomes an array `{"a": {"b": [1, 2, 3] }}`
 #[derive(Debug)]
 pub enum JsonArray {
     /// Convert the nodes into a JSON array even if there is only one element
     Always(JsonType),
     /// Convert the nodes into a JSON array only if there are multiple identical elements
     Infer(JsonType),
+}
+
+/// Used as a parameter for `Config.add_json_type_override`. Defines how the XML path should be matched
+/// in order to apply the JSON type overriding rules. This enumerator exists to allow the same function
+/// to be used for multiple different types of path matching rules.
+#[derive(Debug)]
+pub enum PathMatcher {
+    /// An absolute path starting with a leading slash (`/`). E.g. `/a/b/c/@d`.
+    /// It's implicitly converted from `&str` and automatically includes the leading slash.
+    Absolute(String),
+    /// A regex that will be checked against the XML path. E.g. `(\w/)*c$`.
+    /// It's implicitly converted from `regex::Regex`.
+    #[cfg(feature = "regex_path")]
+    Regex(Regex),
+}
+
+// For retro-compatibility and for syntax's sake, a string may be coerced into an absolute path.
+impl From<&str> for PathMatcher {
+    fn from(value: &str) -> Self {
+        let path_with_leading_slash = if value.starts_with("/") {
+            value.into()
+        } else {
+            ["/", value].concat()
+        };
+
+        PathMatcher::Absolute(path_with_leading_slash)
+    }
+}
+
+// ... While a Regex may be coerced into a regex path.
+#[cfg(feature = "regex_path")]
+impl From<Regex> for PathMatcher {
+    fn from(value: Regex) -> Self {
+        PathMatcher::Regex(value)
+    }
 }
 
 /// Defines which data type to apply in JSON format for consistency of output.
@@ -123,12 +168,12 @@ pub struct Config {
     /// A property name for XML text nodes.
     /// E.g. set it to `text` for `<x a="Hello!">Goodbye!</x>` to become `{"x": {"@a":"Hello!", "text":"Goodbye!"}}`
     /// XML nodes with text only and no attributes or no child elements are converted into JSON properties with the
-    /// name of the element. E.g. <x>Goodbye!</x>` becomes `{"x":"Goodbye!"}`
+    /// name of the element. E.g. `<x>Goodbye!</x>` becomes `{"x":"Goodbye!"}`
     /// Defaults to `#text`
     pub xml_text_node_prop_name: String,
     /// Defines how empty elements like `<x />` should be handled.
     pub empty_element_handling: NullValue,
-    /// A list of XML paths with their JsonType overrides. They take precedence over the document-wide `json_type`
+    /// A map of XML paths with their JsonArray overrides. They take precedence over the document-wide `json_type`
     /// property. The path syntax is based on xPath: literal element names and attribute names prefixed with `@`.
     /// The path must start with a leading `/`. It is a bit of an inconvenience to remember about it, but it saves
     /// an extra `if`-check in the code to improve the performance.
@@ -138,6 +183,10 @@ pub struct Config {
     /// - path for `b` text node (007): `/a/b`
     #[cfg(feature = "json_types")]
     pub json_type_overrides: HashMap<String, JsonArray>,
+    /// A list of pairs of regex and JsonArray overrides. They take precedence over both the document-wide `json_type`
+    /// property and the `json_type_overrides` property. The path syntax is based on xPath just like `json_type_overrides`.
+    #[cfg(feature = "regex_path")]
+    pub json_regex_type_overrides: Vec<(Regex, JsonArray)>,
 }
 
 impl Config {
@@ -152,6 +201,8 @@ impl Config {
             empty_element_handling: NullValue::EmptyObject,
             #[cfg(feature = "json_types")]
             json_type_overrides: HashMap::new(),
+            #[cfg(feature = "regex_path")]
+            json_regex_type_overrides: Vec::new(),
         }
     }
 
@@ -169,6 +220,8 @@ impl Config {
             empty_element_handling,
             #[cfg(feature = "json_types")]
             json_type_overrides: HashMap::new(),
+            #[cfg(feature = "regex_path")]
+            json_regex_type_overrides: Vec::new(),
         }
     }
 
@@ -177,16 +230,24 @@ impl Config {
     /// - **XML**: `<a><b c="123">007</b></a>`
     /// - path for `c`: `/a/b/@c`
     /// - path for `b` text node (007): `/a/b`
-    /// This function will add the leading `/` if it's missing.
+    /// - regex path for any `element` node: `(\w/)*element$` [requires `regex_path` feature]
     #[cfg(feature = "json_types")]
-    pub fn add_json_type_override(self, path: &str, json_type: JsonArray) -> Self {
+    pub fn add_json_type_override<P>(self, path: P, json_type: JsonArray) -> Self
+    where
+        P: Into<PathMatcher>,
+    {
         let mut conf = self;
-        let path = if path.starts_with("/") {
-            path.to_owned()
-        } else {
-            ["/", path].concat()
-        };
-        conf.json_type_overrides.insert(path, json_type);
+
+        match path.into() {
+            PathMatcher::Absolute(path) => {
+                conf.json_type_overrides.insert(path, json_type);
+            }
+            #[cfg(feature = "regex_path")]
+            PathMatcher::Regex(regex) => {
+                conf.json_regex_type_overrides.push((regex, json_type));
+            }
+        }
+
         conf
     }
 }
@@ -251,7 +312,7 @@ fn convert_text(
     el: &roxmltree::Node,
     config: &Config,
     text: &str,
-    json_type_value: JsonType,
+    json_type_value: &JsonType,
 ) -> Option<Value> {
     // process node's attributes, if present
     if el.attributes().count() > 0 {
@@ -275,13 +336,13 @@ fn convert_text(
                 })
                 .chain(vec![(
                     config.xml_text_node_prop_name.clone(),
-                    parse_text(&text[..], config.leading_zero_as_string, &json_type_value),
+                    parse_text(text, config.leading_zero_as_string, &json_type_value),
                 )])
                 .collect(),
         ))
     } else {
         Some(parse_text(
-            &text[..],
+            text,
             config.leading_zero_as_string,
             &json_type_value,
         ))
@@ -292,7 +353,7 @@ fn convert_no_text(
     el: &roxmltree::Node,
     config: &Config,
     path: &String,
-    json_type_value: JsonType,
+    json_type_value: &JsonType,
 ) -> Option<Value> {
     // this element has no text, but may have other child nodes
     let mut data = Map::new();
@@ -320,9 +381,7 @@ fn convert_no_text(
             Some(val) => {
                 let name = &child.tag_name().name().to_string();
                 println!("{:?}", name);
-                if name == "" {
-                    ()
-                } else {
+                if !name.is_empty() {
                     #[cfg(feature = "json_types")]
                     let path = [path.clone(), "/".to_owned(), name.clone()].concat();
                     let (json_type_array, _) = get_json_type(config, &path);
@@ -383,7 +442,7 @@ fn convert_node(el: &roxmltree::Node, config: &Config, path: &String) -> Option<
         Some(mut text) => {
             text = text.trim();
 
-            if text != "" {
+            if !text.is_empty() {
                 convert_text(el, config, text, json_type_value)
             } else {
                 convert_no_text(el, config, path, json_type_value)
@@ -419,20 +478,50 @@ pub fn xml_string_to_json(xml: String, config: &Config) -> Result<Value, roxmltr
 /// in the list of paths with custom config.
 #[cfg(feature = "json_types")]
 #[inline]
-fn get_json_type(config: &Config, path: &String) -> (bool, JsonType) {
+fn get_json_type_with_absolute_path<'conf>(
+    config: &'conf Config,
+    path: &String,
+) -> (bool, &'conf JsonType) {
     match config
         .json_type_overrides
         .get(path)
         .unwrap_or(&JsonArray::Infer(JsonType::Infer))
     {
-        JsonArray::Infer(v) => (false, v.clone()),
-        JsonArray::Always(v) => (true, v.clone()),
+        JsonArray::Infer(v) => (false, v),
+        JsonArray::Always(v) => (true, v),
     }
+}
+
+/// Simply returns `get_json_type_with_absolute_path` if `regex_path` feature is disabled.
+#[cfg(feature = "json_types")]
+#[cfg(not(feature = "regex_path"))]
+#[inline]
+fn get_json_type<'conf>(config: &'conf Config, path: &String) -> (bool, &'conf JsonType) {
+    get_json_type_with_absolute_path(config, path)
+}
+
+/// Returns a tuple for Array and Value enforcements for the current node. Searches both absolute paths
+/// and regex paths, giving precedence to regex paths. Returns `(false, JsonArray::Infer(JsonType::Infer)`
+/// if the current path is not found in the list of paths with custom config.
+#[cfg(feature = "json_types")]
+#[cfg(feature = "regex_path")]
+#[inline]
+fn get_json_type<'conf>(config: &'conf Config, path: &String) -> (bool, &'conf JsonType) {
+    for (regex, json_array) in &config.json_regex_type_overrides {
+        if regex.is_match(path) {
+            return match json_array {
+                JsonArray::Infer(v) => (false, v),
+                JsonArray::Always(v) => (true, v),
+            };
+        }
+    }
+
+    get_json_type_with_absolute_path(config, path)
 }
 
 /// Always returns `(false, JsonArray::Infer(JsonType::Infer)` if `json_types` feature is not enabled.
 #[cfg(not(feature = "json_types"))]
 #[inline]
-fn get_json_type(_config: &Config, _path: &String) -> (bool, JsonType) {
-    (false, JsonType::Infer)
+fn get_json_type<'conf>(_config: &'conf Config, _path: &String) -> (bool, &'conf JsonType) {
+    (false, &JsonType::Infer)
 }
